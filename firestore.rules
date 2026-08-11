@@ -1,0 +1,42 @@
+rules_version = '2';
+
+// TipTransferDemo 전용 임시 규칙
+//
+// 주의: 이 데모는 Android 앱이 Firestore 트랜잭션으로 잔액을 직접 변경한다.
+// 실결제/환전 단계에서는 반드시 서버(Cloud Functions 또는 자체 API)가 잔액을
+// 변경하도록 전환하고, 아래 users update 권한을 서버 전용 구조로 교체해야 한다.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    match /users/{userId} {
+      // 수신자 닉네임 조회와 자신의 잔액 표시를 위해 문서 단위 조회만 허용한다.
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.auth.uid == userId;
+
+      // DEMO ONLY: 송금 트랜잭션이 송신자와 수신자 지갑을 함께 갱신해야 한다.
+      // 운영 전에는 Cloud Functions/서버 API로 대체한다.
+      allow update: if signedIn();
+      allow delete: if false;
+    }
+
+    match /transferSessions/{sessionId} {
+      // QR 세션은 송신자·수신자 두 기기에서 읽고 상태를 전환한다.
+      allow read, create, update: if signedIn();
+      allow delete: if false;
+    }
+
+    match /transactions/{transactionId} {
+      // 내역은 본인이 송신자 또는 수신자인 경우에만 읽는다.
+      allow read: if signedIn()
+        && (resource.data.senderId == request.auth.uid
+          || resource.data.receiverId == request.auth.uid);
+      allow create: if signedIn()
+        && request.resource.data.senderId == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}

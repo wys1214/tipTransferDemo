@@ -1,0 +1,23 @@
+*.iml
+.gradle
+/.idea/
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+# Firebase 설정 파일은 개발 PC별로 내려받아 배치합니다.
+app/google-services.json
+
+# 로컬 Gradle 캐시 및 Android Studio 산출물
+.gradle-user/
+.gradle-user-home/
+.kotlin/
