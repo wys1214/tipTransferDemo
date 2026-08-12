@@ -14,8 +14,9 @@ android {
         applicationId = "com.yunsi.tiptransferdemo"
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        // 실기기에서 설치된 BLE 구현 버전을 구분하기 위한 테스트 빌드 번호.
+        versionCode = 8
+        versionName = "1.0.8-ble-v2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

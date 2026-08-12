@@ -71,6 +71,7 @@ import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.FirebaseFirestoreException
 import com.google.firebase.firestore.SetOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -87,7 +88,12 @@ import kotlinx.coroutines.delay
 private const val MAX_TRANSFER_AMOUNT = 10
 private const val DAILY_SEND_LIMIT = 100L
 
-private data class ReceiverSession(val id: String, val receiverId: String, val nickname: String)
+private data class ReceiverSession(
+    val id: String,
+    val receiverId: String,
+    val nickname: String,
+    val connectionMethod: String = "연결",
+)
 
 @Composable
 fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
@@ -97,7 +103,9 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
     var isSending by remember { mutableStateOf(false) }
     var isComplete by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
-    var useNfc by remember { mutableStateOf(false) }
+    // 기본 전송 방식은 NFC이며, 필요할 때 주변 BLE/QR로 전환한다.
+    var useNfc by remember { mutableStateOf(true) }
+    var useBle by remember { mutableStateOf(false) }
 
     BackHandler {
         when {
@@ -108,11 +116,12 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
     }
 
     when {
-        useNfc -> NfcSendScreen(theme = theme, onBack = { useNfc = false }, onSessionFound = { session = it })
         isComplete -> TransferCompleteScreen(amount = amount, theme = theme, onHome = onBack, onSendMore = {
             session = null
             amount = 1
             isComplete = false
+            useNfc = true
+            useBle = false
         })
         isReadyToSend && session != null -> SendGestureScreen(
             amount = amount,
@@ -129,13 +138,39 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
         )
         session != null -> AmountScreen(
             receiverName = session!!.nickname,
+            connectionMethod = session!!.connectionMethod,
             amount = amount,
             theme = theme,
             onAmountChange = { amount = it },
             onConfirm = { isReadyToSend = true },
             onBack = { session = null },
         )
-        else -> ScannerScreen(theme = theme, onBack = onBack, onUseNfc = { useNfc = true }, onSessionFound = { session = it }, onMessage = { message = it })
+        useBle -> BleFinderScreen(
+            theme = theme,
+            onSessionId = { token ->
+                verifyBleSession(token, theme, {
+                    session = it.copy(connectionMethod = "주변 연결")
+                    useBle = false
+                }, { message = it }) { }
+            },
+            onUseNfc = { useBle = false; useNfc = true },
+            onUseQr = { useBle = false; useNfc = false },
+            onHome = onBack,
+        )
+        useNfc -> NfcSendScreen(
+            theme = theme,
+            onUseBle = { useNfc = false; useBle = true },
+            onUseQr = { useNfc = false },
+            onBack = onBack,
+            onSessionFound = { session = it.copy(connectionMethod = "NFC 연결") },
+        )
+        else -> ScannerScreen(
+            theme = theme,
+            onBack = onBack,
+            onUseNfc = { useNfc = true },
+            onSessionFound = { session = it.copy(connectionMethod = "QR 연결") },
+            onMessage = { message = it },
+        )
     }
 
     message?.let { text ->
@@ -151,8 +186,40 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
     }
 }
 
+private fun verifyBleSession(
+    token: String,
+    theme: VisualTheme,
+    onFound: (ReceiverSession) -> Unit,
+    onError: (String) -> Unit,
+    onComplete: () -> Unit,
+) {
+    FirebaseFirestore.getInstance().collection("transferSessions")
+        .whereEqualTo("bleToken", token)
+        .limit(1)
+        .get()
+        .addOnSuccessListener { result ->
+            val sessionId = result.documents.firstOrNull()?.id
+            if (sessionId == null) {
+                onError("현재 사용할 수 없는 주변 연결이에요. 수신 측에서 주변 연결을 다시 시작해 주세요.")
+                onComplete()
+            } else {
+                verifySession(sessionId, theme, "주변 연결", onFound, onError, onComplete)
+            }
+        }
+        .addOnFailureListener {
+            onError("주변 연결 정보를 확인하지 못했어요. 인터넷 연결을 확인해 주세요.")
+            onComplete()
+        }
+}
+
 @Composable
-private fun NfcSendScreen(theme: VisualTheme, onBack: () -> Unit, onSessionFound: (ReceiverSession) -> Unit) {
+private fun NfcSendScreen(
+    theme: VisualTheme,
+    onUseBle: () -> Unit,
+    onUseQr: () -> Unit,
+    onBack: () -> Unit,
+    onSessionFound: (ReceiverSession) -> Unit,
+) {
     val context = LocalContext.current
     val activity = context.findActivity()
     val adapter = remember { NfcAdapter.getDefaultAdapter(context) }
@@ -171,26 +238,36 @@ private fun NfcSendScreen(theme: VisualTheme, onBack: () -> Unit, onSessionFound
         adapter.enableReaderMode(
             activity,
             readerCallback@ { tag ->
-                val isoDep = IsoDep.get(tag) ?: return@readerCallback
+                val isoDep = IsoDep.get(tag)
+                if (isoDep == null) {
+                    activity.runOnUiThread {
+                        message = "NFC는 감지했지만 이 기기는 전송용 NFC 형식(ISO-DEP)을 지원하지 않아요. QR로 전송해 주세요."
+                    }
+                    return@readerCallback
+                }
                 try {
                     isoDep.connect()
                     val response = isoDep.transceive(byteArrayOf(0x00, 0xA4.toByte(), 0x04, 0x00, 0x06, 0xF0.toByte(), 0x12, 0x34, 0x56, 0x78, 0x90.toByte(), 0x00))
-                    if (response.size <= 2) throw IllegalStateException()
+                    if (response.size <= 2 || response[response.size - 2] != 0x90.toByte() || response.last() != 0x00.toByte()) {
+                        throw IllegalStateException("수신 기기에서 NFC 전송 세션을 열지 않았어요.")
+                    }
                     val sessionId = String(response.copyOfRange(0, response.size - 2), Charsets.UTF_8)
                     if (sessionId.isBlank()) throw IllegalStateException()
                     activity.runOnUiThread {
                         if (!checking) {
                             checking = true
-                            verifySession(sessionId, theme, onSessionFound, { message = it }) { checking = false }
+                            verifySession(sessionId, theme, "NFC 세션", onSessionFound, { message = it }) { checking = false }
                         }
                     }
-                } catch (_: Exception) {
-                    activity.runOnUiThread { message = "NFC 연결에 실패했어요. 두 기기를 다시 가까이 대세요." }
+                } catch (error: Exception) {
+                    activity.runOnUiThread {
+                        message = error.message ?: "NFC 연결에 실패했어요. 두 기기를 다시 가까이 대세요."
+                    }
                 } finally {
                     try { isoDep.close() } catch (_: Exception) { }
                 }
             },
-            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
             null,
         )
         onDispose { adapter.disableReaderMode(activity) }
@@ -203,8 +280,14 @@ private fun NfcSendScreen(theme: VisualTheme, onBack: () -> Unit, onSessionFound
         Spacer(Modifier.height(18.dp))
         Text("〰", color = theme.primary, fontSize = 84.sp)
         Text(message ?: if (checking) "수신 세션을 확인하는 중이에요." else "NFC 연결을 기다리고 있어요.", color = Color(0xFF64748B), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-        Spacer(Modifier.height(28.dp))
-        ThemeButton(theme = theme, onClick = onBack, modifier = Modifier.fillMaxWidth()) { Text("QR 스캔으로 전환") }
+        Spacer(Modifier.height(16.dp))
+        Text("연결이 되지 않으면 QR로 바로 전송할 수 있어요.", color = theme.primary, fontSize = 13.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Spacer(Modifier.height(12.dp))
+        ThemeButton(theme = theme, onClick = onUseBle, modifier = Modifier.fillMaxWidth()) { Text("가까운 사람 찾기") }
+        Spacer(Modifier.height(10.dp))
+        ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("NFC가 안 되나요? QR로 전송") }
+        Spacer(Modifier.height(10.dp))
+        Button(onClick = onBack, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("홈으로") }
     }
 }
 
@@ -233,16 +316,28 @@ private fun ScannerScreen(theme: VisualTheme, onBack: () -> Unit, onUseNfc: () -
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    var manualSessionId by remember { mutableStateOf("") }
     var checking by remember { mutableStateOf(false) }
+    // 카메라는 같은 QR을 연속 프레임으로 인식한다. 첫 인식 뒤에는 화면 전환까지 잠근다.
+    var scanLocked by remember { mutableStateOf(false) }
     var torchOn by remember { mutableStateOf(false) }
     var torchControl by remember { mutableStateOf<((Boolean) -> Unit)?>(null) }
     var cameraError by remember { mutableStateOf<String?>(null) }
     var cameraRetryKey by remember { mutableStateOf(0) }
     val verify: (String) -> Unit = { id ->
-        if (checking) Unit else {
+        if (checking || scanLocked) Unit else {
             checking = true
-            verifySession(id, theme, onSessionFound, { onMessage(it) }) { checking = false }
+            scanLocked = true
+            verifySession(
+                id = id,
+                theme = theme,
+                connectionName = "QR 코드",
+                onFound = onSessionFound,
+                onError = {
+                    scanLocked = false
+                    onMessage(it)
+                },
+                onComplete = { checking = false },
+            )
         }
     }
     if (!granted) {
@@ -330,20 +425,23 @@ private fun ScannerScreen(theme: VisualTheme, onBack: () -> Unit, onUseNfc: () -
             Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(20.dp).fillMaxWidth().background(Color.White, RoundedCornerShape(24.dp)).border(1.dp, theme.primary.copy(alpha = .35f), RoundedCornerShape(24.dp)).padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("테스트 연결", color = theme.primary, fontWeight = FontWeight.Bold)
+            Text("다른 전송 방식", color = theme.primary, fontWeight = FontWeight.Bold)
             ThemeButton(theme = theme, onClick = onUseNfc, modifier = Modifier.fillMaxWidth()) { Text("NFC로 연결") }
-            Text("테스트 환경에서는 세션 ID로 확인할 수 있어요.", color = Color(0xFF64748B), fontSize = 12.sp)
-            OutlinedTextField(value = manualSessionId, onValueChange = { manualSessionId = it }, label = { Text("테스트용 세션 ID") }, singleLine = true)
-            Button(onClick = { verify(manualSessionId.trim()) }, enabled = manualSessionId.isNotBlank() && !checking, colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) {
-                if (checking) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text("세션 ID로 확인")
-            }
             ThemeButton(theme = theme, onClick = onBack) { Text("취소") }
         }
     }
 }
 
 @Composable
-private fun AmountScreen(receiverName: String, amount: Int, theme: VisualTheme, onAmountChange: (Int) -> Unit, onConfirm: () -> Unit, onBack: () -> Unit) {
+private fun AmountScreen(
+    receiverName: String,
+    connectionMethod: String,
+    amount: Int,
+    theme: VisualTheme,
+    onAmountChange: (Int) -> Unit,
+    onConfirm: () -> Unit,
+    onBack: () -> Unit,
+) {
     var input by remember(amount) { mutableStateOf(amount.toString()) }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
@@ -351,6 +449,12 @@ private fun AmountScreen(receiverName: String, amount: Int, theme: VisualTheme, 
         verticalArrangement = Arrangement.spacedBy(18.dp, Alignment.CenterVertically),
     ) {
         Text("$receiverName 님에게 보낼 재화를 선택하세요")
+        Text(
+            "연결 확인 · $connectionMethod",
+            color = theme.primary,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(onClick = { onAmountChange((amount - 1).coerceAtLeast(1)) }, colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("−") }
             OutlinedTextField(value = input, onValueChange = {
@@ -370,6 +474,10 @@ private fun AmountScreen(receiverName: String, amount: Int, theme: VisualTheme, 
 @Composable
 private fun SendGestureScreen(amount: Int, theme: VisualTheme, isSending: Boolean, onBack: () -> Unit, onSend: () -> Unit) {
     var launchStarted by remember { mutableStateOf(false) }
+    // 드래그 이벤트 한 번의 이동량이 아니라 누적 이동량을 사용한다.
+    // 손가락 이동을 즉시 그래픽에 반영해 잠금 해제처럼 반응하게 한다.
+    var dragOffsetY by remember { mutableStateOf(0f) }
+    val dragVisualOffset = dragOffsetY.coerceIn(-140f, 0f).dp
     val tokenOffset by animateDpAsState(
         targetValue = if (launchStarted && theme == VisualTheme.PURPLE) (-760).dp else 0.dp,
         animationSpec = tween(durationMillis = 620),
@@ -405,9 +513,19 @@ private fun SendGestureScreen(amount: Int, theme: VisualTheme, isSending: Boolea
         }
         Box(
             Modifier.fillMaxWidth().height(260.dp).pointerInput(isSending, launchStarted) {
-                detectVerticalDragGestures { _, dragAmount ->
-                    if (dragAmount < -80f && !isSending && !launchStarted) launchStarted = true
-                }
+                detectVerticalDragGestures(
+                    onDragStart = { dragOffsetY = 0f },
+                    onDragEnd = { if (!launchStarted) dragOffsetY = 0f },
+                    onVerticalDrag = { _, dragAmount ->
+                        if (!isSending && !launchStarted) {
+                            dragOffsetY = (dragOffsetY + dragAmount).coerceAtMost(0f)
+                            if (dragOffsetY <= -64f) {
+                                launchStarted = true
+                                dragOffsetY = 0f
+                            }
+                        }
+                    },
+                )
             }, contentAlignment = Alignment.Center,
         ) {
             if (theme == VisualTheme.PURPLE && launchStarted) {
@@ -421,7 +539,10 @@ private fun SendGestureScreen(amount: Int, theme: VisualTheme, isSending: Boolea
             } else if (isSending) {
                 CircularProgressIndicator(color = if (theme == VisualTheme.PURPLE) Color.White else theme.primary)
             } else {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    modifier = Modifier.offset(y = dragVisualOffset),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
                     if (theme == VisualTheme.GOLD) GoldCoin(Modifier.rotate(tokenRotation), size = 76.dp)
                     else if (theme == VisualTheme.ROCKET) RocketShip(size = 96.dp)
                     else if (theme == VisualTheme.PURPLE) PurpleToken(size = 94.dp)
@@ -639,16 +760,23 @@ fun CelebrationSparkles(theme: VisualTheme) {
     }
 }
 
-private fun verifySession(id: String, theme: VisualTheme, onFound: (ReceiverSession) -> Unit, onError: (String) -> Unit, onComplete: () -> Unit) {
+private fun verifySession(
+    id: String,
+    theme: VisualTheme,
+    connectionName: String,
+    onFound: (ReceiverSession) -> Unit,
+    onError: (String) -> Unit,
+    onComplete: () -> Unit,
+) {
     val db = FirebaseFirestore.getInstance()
     val sessionRef = db.collection("transferSessions").document(id)
     val senderId = FirebaseAuth.getInstance().currentUser?.uid
     if (senderId == null) { onError("로그인 정보를 찾을 수 없어요."); onComplete(); return }
     db.runTransaction<String> { tx ->
         val snapshot = tx.get(sessionRef)
-        val receiverId = snapshot.getString("receiverId") ?: throw IllegalStateException("유효하지 않은 QR이에요.")
-        if (snapshot.getString("status") != "active") throw IllegalStateException("이미 사용 중이거나 종료된 QR이에요.")
-        if (receiverId == senderId) throw IllegalStateException("내 QR에는 보낼 수 없어요.")
+        val receiverId = snapshot.getString("receiverId") ?: throw IllegalStateException("유효하지 않은 ${connectionName}이에요.")
+        if (snapshot.getString("status") != "active") throw IllegalStateException("이미 사용되었거나 종료된 ${connectionName}이에요. 수신자가 다시 열어 주세요.")
+        if (receiverId == senderId) throw IllegalStateException("내 ${connectionName}으로는 보낼 수 없어요.")
         tx.update(
             sessionRef,
             "status", "claimed",
@@ -696,7 +824,20 @@ private fun transfer(session: ReceiverSession, amount: Int, onSuccess: () -> Uni
         )
         tx.set(historyRef, mapOf("senderId" to sender.uid, "receiverId" to session.receiverId, "amount" to amount, "type" to "transfer", "createdAt" to FieldValue.serverTimestamp()))
         null
-    }.addOnSuccessListener { onSuccess() }.addOnFailureListener { error -> onError(error.message ?: "전송을 완료하지 못했어요.") }
+    }.addOnSuccessListener { onSuccess() }.addOnFailureListener { error ->
+        onError(transferFailureMessage(error))
+    }
+}
+
+private fun transferFailureMessage(error: Exception): String {
+    val networkFailure = error as? FirebaseFirestoreException
+    return when (networkFailure?.code) {
+        FirebaseFirestoreException.Code.UNAVAILABLE,
+        FirebaseFirestoreException.Code.DEADLINE_EXCEEDED,
+        FirebaseFirestoreException.Code.ABORTED ->
+            "인터넷 연결이 불안정해 전송 결과를 확인하지 못했어요. 중복 전송을 피하기 위해 다시 보내지 말고, 최근 내역에서 먼저 결과를 확인해 주세요."
+        else -> error.message ?: "전송을 완료하지 못했어요. 잔액과 최근 내역을 확인해 주세요."
+    }
 }
 
 @Composable

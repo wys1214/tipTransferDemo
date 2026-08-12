@@ -1,8 +1,15 @@
 package com.yunsi.tiptransferdemo
 
 import android.graphics.Bitmap
+import android.Manifest
+import android.app.Activity
+import android.os.Build
+import android.content.pm.PackageManager
+import android.nfc.NfcAdapter
 import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -41,6 +48,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -51,6 +59,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import androidx.core.content.ContextCompat
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
@@ -65,13 +74,16 @@ import java.util.UUID
 @Composable
 fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -> Unit) {
     var sessionId by remember { mutableStateOf<String?>(null) }
+    var bleToken by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("creating") }
     var secondsLeft by remember { mutableIntStateOf(60) }
     var receivedAmount by remember { mutableStateOf<Long?>(null) }
     var sessionTheme by remember { mutableStateOf<VisualTheme?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var refreshKey by remember { mutableIntStateOf(0) }
-    var nfcMode by remember { mutableStateOf(false) }
+    // 기본 수신 방식은 NFC이며, 필요할 때 주변 BLE/QR로 전환한다.
+    var nfcMode by remember { mutableStateOf(true) }
+    var bleMode by remember { mutableStateOf(false) }
     val db = FirebaseFirestore.getInstance()
     val view = LocalView.current
     DisposableEffect(view) {
@@ -103,6 +115,7 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
 
     LaunchedEffect(refreshKey) {
         sessionId = null
+        bleToken = null
         status = "creating"
         receivedAmount = null
         sessionTheme = null
@@ -118,11 +131,13 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
                 )
             }
         val id = UUID.randomUUID().toString()
+        val newBleToken = UUID.randomUUID().toString().replace("-", "").take(16)
         db.collection("transferSessions").document(id).set(mapOf(
             "receiverId" to uid,
+            "bleToken" to newBleToken,
             "status" to "active",
             "createdAt" to Timestamp.now(),
-        )).addOnSuccessListener { sessionId = id; status = "active" }
+        )).addOnSuccessListener { sessionId = id; bleToken = newBleToken; status = "active" }
             .addOnFailureListener { error = "QR을 준비하지 못했어요. 다시 시도해 주세요." }
     }
 
@@ -166,8 +181,16 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
     when (status) {
         "claimed" -> ReceivingWaitScreen(theme = displayedTheme, secondsLeft = secondsLeft, onCancel = { cancelSession(); refreshKey += 1 })
         "used" -> ReceiveCompleteScreen(theme = displayedTheme, amount = receivedAmount ?: 0L, onHome = onBack, onReceiveMore = { refreshKey += 1 })
-        else -> if (nfcMode) {
-            NfcReadyScreen(theme = displayedTheme, sessionId = sessionId, error = error, onUseQr = { NfcSessionHostService.clearSession(sessionId); nfcMode = false }, onHome = { cancelSession(); onBack() })
+        else -> if (bleMode) {
+            BleReadyScreen(
+                theme = displayedTheme,
+                sessionId = bleToken,
+                onUseNfc = { bleMode = false; nfcMode = true },
+                onUseQr = { bleMode = false; nfcMode = false },
+                onHome = { cancelSession(); onBack() },
+            )
+        } else if (nfcMode) {
+            NfcReadyScreen(theme = displayedTheme, sessionId = sessionId, error = error, onUseBle = { NfcSessionHostService.clearSession(sessionId); nfcMode = false; bleMode = true }, onUseQr = { NfcSessionHostService.clearSession(sessionId); nfcMode = false }, onHome = { cancelSession(); onBack() })
         } else {
             QrReadyScreen(theme = displayedTheme, sessionId = sessionId, error = error, onUseNfc = { sessionId?.let(NfcSessionHostService::setSession); nfcMode = true }, onRefresh = { cancelSession(); refreshKey += 1 }, onHome = { cancelSession(); onBack() })
         }
@@ -202,16 +225,74 @@ private fun QrReadyScreen(theme: VisualTheme, sessionId: String?, error: String?
 }
 
 @Composable
-private fun NfcReadyScreen(theme: VisualTheme, sessionId: String?, error: String?, onUseQr: () -> Unit, onHome: () -> Unit) {
+private fun NfcReadyScreen(theme: VisualTheme, sessionId: String?, error: String?, onUseBle: () -> Unit, onUseQr: () -> Unit, onHome: () -> Unit) {
+    val context = LocalContext.current
+    val adapter = remember { NfcAdapter.getDefaultAdapter(context) }
+    val hasHce = remember {
+        context.packageManager.hasSystemFeature(PackageManager.FEATURE_NFC_HOST_CARD_EMULATION)
+    }
+    val deviceStatus = when {
+        adapter == null -> "이 기기는 NFC를 지원하지 않아요. QR로 받아 주세요."
+        !adapter.isEnabled -> "NFC가 꺼져 있어요. 기기 설정에서 NFC를 켜 주세요."
+        !hasHce -> "이 기기는 NFC 수신(HCE)을 지원하지 않아요. QR로 받아 주세요."
+        sessionId == null || error != null -> error ?: "NFC 세션을 준비 중이에요."
+        else -> "NFC 수신을 기다리고 있어요."
+    }
     Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text("NFC로 받기", color = theme.primary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(16.dp))
         Text("휴대폰 뒷면을 상대방 휴대폰과 가까이 대세요.", textAlign = TextAlign.Center)
         Spacer(Modifier.height(18.dp))
         Text("〰", color = theme.primary, fontSize = 84.sp)
-        Text(if (sessionId != null && error == null) "NFC 수신을 기다리고 있어요." else (error ?: "NFC 세션을 준비 중이에요."), color = Color(0xFF64748B), textAlign = TextAlign.Center)
+        Text(deviceStatus, color = Color(0xFF64748B), textAlign = TextAlign.Center)
+        Spacer(Modifier.height(16.dp))
+        Text("연결이 되지 않으면 QR로 바로 받을 수 있어요.", color = theme.primary, fontSize = 13.sp, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(12.dp))
+        ThemeButton(theme = theme, onClick = onUseBle, modifier = Modifier.fillMaxWidth()) { Text("가까운 사람과 연결") }
+        Spacer(Modifier.height(10.dp))
+        ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("NFC가 안 되나요? QR로 받기") }
+        Spacer(Modifier.height(10.dp))
+        Button(onClick = onHome, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("홈으로") }
+    }
+}
+
+@Composable
+private fun BleReadyScreen(theme: VisualTheme, sessionId: String?, onUseNfc: () -> Unit, onUseQr: () -> Unit, onHome: () -> Unit) {
+    val context = LocalContext.current
+    val host = remember { BleSessionHost(context) }
+    var message by remember { mutableStateOf("주변 송신자를 기다리고 있어요.") }
+    var granted by remember {
+        mutableStateOf(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else true)
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        granted = result[Manifest.permission.BLUETOOTH_ADVERTISE] == true && result[Manifest.permission.BLUETOOTH_CONNECT] == true
+    }
+    var retryKey by remember { mutableIntStateOf(0) }
+    LaunchedEffect(granted, sessionId, retryKey) {
+        if (!granted) {
+            permissionLauncher.launch(arrayOf(Manifest.permission.BLUETOOTH_ADVERTISE, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN))
+        } else if (sessionId != null) {
+            message = "주변 연결을 준비하는 중이에요."
+            host.start(sessionId, onReady = { message = "BLE 수신 광고가 시작됐어요. 주변 송신자를 기다리고 있어요." }, onError = { message = it })
+        }
+    }
+    DisposableEffect(Unit) { onDispose { host.stop() } }
+    Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Text("주변에서 받기", color = theme.primary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(16.dp))
+        Text("상대방이 가까운 사람 찾기를 누르면 자동으로 연결돼요.", textAlign = TextAlign.Center)
+        Spacer(Modifier.height(18.dp))
+        Text("⌁", color = theme.primary, fontSize = 84.sp)
+        Text(if (granted) message else "주변 기기 권한을 허용해 주세요.", color = Color(0xFF64748B), textAlign = TextAlign.Center)
         Spacer(Modifier.height(28.dp))
-        ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("QR로 전환") }
+        ThemeButton(theme = theme, onClick = { retryKey += 1 }, modifier = Modifier.fillMaxWidth()) { Text("주변 연결 다시 시작") }
+        Spacer(Modifier.height(10.dp))
+        ThemeButton(theme = theme, onClick = onUseNfc, modifier = Modifier.fillMaxWidth()) { Text("NFC로 받기") }
+        Spacer(Modifier.height(10.dp))
+        ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("QR로 받기") }
         Spacer(Modifier.height(10.dp))
         Button(onClick = onHome, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("홈으로") }
     }
