@@ -1,3 +1,6 @@
+Exit code: 0
+Wall time: 1.9 seconds
+Output:
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -14,8 +17,9 @@ android {
         applicationId = "com.yunsi.tiptransferdemo"
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        // 실기기에서 설치된 BLE 구현 버전을 구분하기 위한 테스트 빌드 번호.
+        versionCode = 8
+        versionName = "1.0.8-ble-v2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -63,3 +67,4 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
+
