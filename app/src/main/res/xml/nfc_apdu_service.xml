@@ -1,8 +1,12 @@
+Exit code: 0
+Wall time: 1.9 seconds
+Output:
 <?xml version="1.0" encoding="utf-8"?>
 <host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
     android:description="@string/app_name"
-    android:requireDeviceUnlock="true">
+    android:requireDeviceUnlock="false">
     <aid-group android:category="other" android:description="@string/nfc_session_service_description">
         <aid-filter android:name="F01234567890" />
     </aid-group>
 </host-apdu-service>
+
