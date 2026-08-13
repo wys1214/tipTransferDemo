@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.delay
 
 @Composable
@@ -42,9 +43,11 @@ fun BleFinderScreen(
     val adapter = remember { BluetoothAdapter.getDefaultAdapter() }
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val candidates = remember { mutableStateListOf<ScanResult>() }
+    val receiverNames = remember { mutableStateMapOf<String, String>() }
     var message by remember { mutableStateOf("가까운 사람을 찾는 중이에요.") }
     var retryKey by remember { mutableIntStateOf(0) }
     var rawSignalCount by remember { mutableIntStateOf(0) }
+    var showQrFallback by remember { mutableStateOf(false) }
     var granted by remember {
         mutableStateOf(if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
@@ -84,6 +87,10 @@ fun BleFinderScreen(
                                 ?.let(::decodeAdvertisedToken) == token
                         }) {
                         candidates += result
+                        receiverNames[token] = "이름 확인 중"
+                        loadReceiverName(token) { name ->
+                            mainHandler.post { receiverNames[token] = name }
+                        }
                         message = "가까운 수신자를 찾았어요. 연결할 사용자를 선택해 주세요."
                     }
                 }
@@ -130,11 +137,14 @@ fun BleFinderScreen(
         if (!granted || adapter?.isEnabled != true) return@LaunchedEffect
         delay(5_000)
         if (candidates.isEmpty()) {
-            message = if (rawSignalCount == 0) {
-                "주변 BLE 신호를 전혀 받지 못하고 있어요. 두 기기의 블루투스를 껐다 켠 뒤 다시 시도해 주세요."
-            } else {
-                "주변 BLE 신호 ${rawSignalCount}개를 찾았지만 팁 전송 수신 광고는 찾지 못했어요. 수신 기기에서 ‘주변 연결 다시 시작’을 눌러 주세요."
-            }
+            message = "가까운 수신자를 찾는 중이에요. 잠시만 기다려 주세요."
+        }
+        // BLE는 기기 설정과 주변 환경 영향을 받을 수 있으므로, 기다림이 길어지면
+        // 사용자가 막히지 않도록 QR 연결을 우선 제안한다.
+        delay(7_000)
+        if (candidates.isEmpty()) {
+            showQrFallback = true
+            message = "주변 연결이 지연되고 있어요. QR로 전환하면 바로 연결할 수 있어요."
         }
     }
     fun connect(result: ScanResult) {
@@ -175,12 +185,15 @@ fun BleFinderScreen(
     }
     Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text("가까운 사람 찾기", color = theme.primary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(6.dp))
-        Text("BLE 연결 v2", color = theme.primary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(12.dp)); Text(message, color = Color(0xFF64748B), textAlign = TextAlign.Center)
         Spacer(Modifier.height(22.dp))
         if (candidates.isEmpty()) Text("수신자가 ‘주변에서 받기’를 열면 여기에 표시돼요.", textAlign = TextAlign.Center)
         candidates.forEachIndexed { index, candidate ->
+            val candidateToken = candidate.scanRecord
+                ?.getManufacturerSpecificData(BleSessionHost.MANUFACTURER_ID)
+                ?.let(::decodeAdvertisedToken)
+            val receiverName = candidateToken?.let { receiverNames[it] }
+                ?: "가까운 사용자 ${index + 1}"
             ThemeButton(
                 theme = theme,
                 onClick = {
@@ -196,17 +209,64 @@ fun BleFinderScreen(
                     }
                 },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-            ) { Text("가까운 사용자 ${index + 1} · 연결") }
+            ) { Text("$receiverName · 연결") }
         }
         Spacer(Modifier.height(18.dp))
-        ThemeButton(theme = theme, onClick = { candidates.clear(); rawSignalCount = 0; message = "가까운 사람을 다시 찾는 중이에요."; retryKey += 1 }, modifier = Modifier.fillMaxWidth()) { Text("주변 기기 다시 찾기") }
+        ThemeButton(theme = theme, onClick = {
+            candidates.clear()
+            rawSignalCount = 0
+            showQrFallback = false
+            message = "가까운 사람을 다시 찾는 중이에요."
+            retryKey += 1
+        }, modifier = Modifier.fillMaxWidth()) { Text("주변 기기 다시 찾기") }
         Spacer(Modifier.height(10.dp))
         ThemeButton(theme = theme, onClick = onUseNfc, modifier = Modifier.fillMaxWidth()) { Text("NFC로 보내기") }
         Spacer(Modifier.height(10.dp))
-        ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("QR로 보내기") }
+        if (showQrFallback) {
+            Button(
+                onClick = onUseQr,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+            ) { Text("QR로 바로 연결") }
+        } else {
+            ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("QR로 보내기") }
+        }
         Spacer(Modifier.height(10.dp))
         Button(onClick = onHome, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("홈으로") }
     }
+}
+
+private fun loadReceiverName(token: String, onResult: (String) -> Unit) {
+    val db = FirebaseFirestore.getInstance()
+    db.collection("transferSessions")
+        .whereEqualTo("bleToken", token)
+        .limit(1)
+        .get()
+        .addOnSuccessListener { sessions ->
+            val session = sessions.documents.firstOrNull()
+            if (session == null) {
+                onResult("현재 사용할 수 없는 수신자")
+                return@addOnSuccessListener
+            }
+            // 새 세션은 생성 시점의 수신자 이름을 함께 저장한다.
+            // 이전 세션도 지원하도록 값이 없을 때만 users 문서를 보조 조회한다.
+            val sessionName = session.getString("receiverNickname")?.takeIf { it.isNotBlank() }
+            if (sessionName != null) {
+                onResult(sessionName)
+            } else {
+                val receiverId = session.getString("receiverId")
+                if (receiverId == null) {
+                    onResult("가까운 사용자")
+                } else {
+                    db.collection("users").document(receiverId).get()
+                        .addOnSuccessListener { user ->
+                            onResult(user.getString("nickname")?.takeIf { it.isNotBlank() } ?: "가까운 사용자")
+                        }
+                        .addOnFailureListener { onResult("가까운 사용자") }
+                }
+            }
+        }
+        .addOnFailureListener { onResult("가까운 사용자") }
 }
 
 private fun decodeSessionId(value: ByteArray): String = String(value, Charsets.UTF_8).trim()

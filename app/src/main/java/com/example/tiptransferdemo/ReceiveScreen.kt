@@ -6,6 +6,8 @@ import android.app.Activity
 import android.os.Build
 import android.content.pm.PackageManager
 import android.nfc.NfcAdapter
+import android.nfc.cardemulation.CardEmulation
+import android.content.ComponentName
 import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -129,11 +131,18 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
                     "cancelledAt", Timestamp.now(),
                     "cleanupAt", terminalSessionCleanupAt(),
                 )
-            }
+        }
         val id = UUID.randomUUID().toString()
         val newBleToken = UUID.randomUUID().toString().replace("-", "").take(16)
+        // BLE 목록에서는 users 문서를 추가로 읽지 않고, 활성 수신 세션에 저장된
+        // 표시 이름을 사용한다. 연결 전에 필요한 조회를 한 번으로 제한한다.
+        val receiverNickname = db.collection("users").document(uid).get().await()
+            .getString("nickname")
+            ?.takeIf { it.isNotBlank() }
+            ?: "사용자"
         db.collection("transferSessions").document(id).set(mapOf(
             "receiverId" to uid,
+            "receiverNickname" to receiverNickname,
             "bleToken" to newBleToken,
             "status" to "active",
             "createdAt" to Timestamp.now(),
@@ -227,13 +236,32 @@ private fun QrReadyScreen(theme: VisualTheme, sessionId: String?, error: String?
 @Composable
 private fun NfcReadyScreen(theme: VisualTheme, sessionId: String?, error: String?, onUseBle: () -> Unit, onUseQr: () -> Unit, onHome: () -> Unit) {
     val context = LocalContext.current
+    val activity = context.findActivity()
     val adapter = remember { NfcAdapter.getDefaultAdapter(context) }
+    val nfcEnabled = rememberNfcEnabled(context, adapter)
+    DisposableEffect(adapter, activity, sessionId) {
+        if (adapter != null && activity != null && sessionId != null) {
+            try {
+                CardEmulation.getInstance(adapter).setPreferredService(
+                    activity,
+                    ComponentName(context, NfcSessionHostService::class.java),
+                )
+            } catch (_: Exception) {
+                // 기본 AID 라우팅이 가능한 기기에서는 우선 지정 실패 후에도 HCE가 동작할 수 있다.
+            }
+        }
+        onDispose {
+            if (adapter != null && activity != null) {
+                try { CardEmulation.getInstance(adapter).unsetPreferredService(activity) } catch (_: Exception) { }
+            }
+        }
+    }
     val hasHce = remember {
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_NFC_HOST_CARD_EMULATION)
     }
     val deviceStatus = when {
         adapter == null -> "이 기기는 NFC를 지원하지 않아요. QR로 받아 주세요."
-        !adapter.isEnabled -> "NFC가 꺼져 있어요. 기기 설정에서 NFC를 켜 주세요."
+        !nfcEnabled -> "NFC가 꺼져 있어요. 기기 설정에서 NFC를 켜 주세요."
         !hasHce -> "이 기기는 NFC 수신(HCE)을 지원하지 않아요. QR로 받아 주세요."
         sessionId == null || error != null -> error ?: "NFC 세션을 준비 중이에요."
         else -> "NFC 수신을 기다리고 있어요."

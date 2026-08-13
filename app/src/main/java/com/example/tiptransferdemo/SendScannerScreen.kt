@@ -223,18 +223,21 @@ private fun NfcSendScreen(
     val context = LocalContext.current
     val activity = context.findActivity()
     val adapter = remember { NfcAdapter.getDefaultAdapter(context) }
+    val nfcEnabled = rememberNfcEnabled(context, adapter)
     var message by remember { mutableStateOf<String?>(null) }
     var checking by remember { mutableStateOf(false) }
 
-    DisposableEffect(adapter, activity) {
+    DisposableEffect(adapter, activity, nfcEnabled) {
         if (adapter == null || activity == null) {
             message = "이 기기에서는 NFC를 사용할 수 없어요."
             return@DisposableEffect onDispose { }
         }
-        if (!adapter.isEnabled) {
+        if (!nfcEnabled) {
             message = "NFC를 켠 뒤 다시 시도해 주세요."
             return@DisposableEffect onDispose { }
         }
+        // NFC를 다시 켠 뒤에는 꺼져 있을 때의 안내를 남기지 않는다.
+        message = null
         adapter.enableReaderMode(
             activity,
             readerCallback@ { tag ->
@@ -267,7 +270,9 @@ private fun NfcSendScreen(
                     try { isoDep.close() } catch (_: Exception) { }
                 }
             },
-            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_NFC_B or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
+            // Android HCE의 ISO-DEP 카드는 NFC-A 지원이 보장된다. NFC-B까지 함께
+            // 요청하면 일부 기기에서 잘못된 기술 선택으로 HCE 응답을 받지 못할 수 있다.
+            NfcAdapter.FLAG_READER_NFC_A or NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK,
             null,
         )
         onDispose { adapter.disableReaderMode(activity) }
@@ -279,7 +284,12 @@ private fun NfcSendScreen(
         Text("수신자의 NFC 받기 화면을 연 뒤\n휴대폰 뒷면을 가까이 대세요.", textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         Spacer(Modifier.height(18.dp))
         Text("〰", color = theme.primary, fontSize = 84.sp)
-        Text(message ?: if (checking) "수신 세션을 확인하는 중이에요." else "NFC 연결을 기다리고 있어요.", color = Color(0xFF64748B), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Text(
+            if (!nfcEnabled) "NFC가 꺼져 있어요. 기기 설정에서 NFC를 켠 뒤 다시 시도해 주세요."
+            else message ?: if (checking) "수신 세션을 확인하는 중이에요." else "NFC 연결을 기다리고 있어요.",
+            color = Color(0xFF64748B),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+        )
         Spacer(Modifier.height(16.dp))
         Text("연결이 되지 않으면 QR로 바로 전송할 수 있어요.", color = theme.primary, fontSize = 13.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         Spacer(Modifier.height(12.dp))
@@ -291,7 +301,7 @@ private fun NfcSendScreen(
     }
 }
 
-private fun Context.findActivity(): Activity? = when (this) {
+fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
     is ContextWrapper -> baseContext.findActivity()
     else -> null
@@ -412,22 +422,29 @@ private fun ScannerScreen(theme: VisualTheme, onBack: () -> Unit, onUseNfc: () -
         torchControl?.let { control ->
             Button(
                 onClick = { torchOn = !torchOn; control(torchOn) },
-                modifier = Modifier.align(Alignment.TopEnd).padding(top = 70.dp, end = 38.dp).size(44.dp),
-                shape = CircleShape,
+                // QR 프레임과 하단 전송 패널의 가운데 여백에 둔다.
+                modifier = Modifier.align(Alignment.Center).offset(y = 128.dp).height(38.dp),
+                shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color.White,
                     contentColor = theme.primary,
                 ),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = .75f)),
-            ) { Text(if (torchOn) "☼" else "◉", fontSize = 18.sp) }
+                border = androidx.compose.foundation.BorderStroke(1.dp, theme.primary.copy(alpha = .45f)),
+            ) {
+                Text(if (torchOn) "⚡ 플래시 끄기" else "⚡ 플래시 켜기", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
         }
         Column(
-            Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(20.dp).fillMaxWidth().background(Color.White, RoundedCornerShape(24.dp)).border(1.dp, theme.primary.copy(alpha = .35f), RoundedCornerShape(24.dp)).padding(16.dp),
+            Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 20.dp, vertical = 16.dp).fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text("다른 전송 방식", color = theme.primary, fontWeight = FontWeight.Bold)
-            ThemeButton(theme = theme, onClick = onUseNfc, modifier = Modifier.fillMaxWidth()) { Text("NFC로 연결") }
-            ThemeButton(theme = theme, onClick = onBack) { Text("취소") }
+            ThemeButton(theme = theme, onClick = onUseNfc, modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("NFC로 연결") }
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onBack,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+            ) { Text("홈으로") }
         }
     }
 }
