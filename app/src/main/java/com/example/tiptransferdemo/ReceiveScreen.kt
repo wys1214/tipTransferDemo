@@ -38,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -80,6 +81,7 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
     var status by remember { mutableStateOf("creating") }
     var secondsLeft by remember { mutableIntStateOf(60) }
     var receivedAmount by remember { mutableStateOf<Long?>(null) }
+    var deliveredCount by remember { mutableStateOf(0L) }
     var sessionTheme by remember { mutableStateOf<VisualTheme?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var refreshKey by remember { mutableIntStateOf(0) }
@@ -95,7 +97,7 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
     fun cancelSession() {
         sessionId?.let { id ->
             NfcSessionHostService.clearSession(id)
-            if (status == "active" || status == "claimed") {
+            if (status == "active" || status == "claimed" || status == "reopened" || status == "ready_for_more") {
                 db.collection("transferSessions").document(id).update(
                     "status", "cancelled",
                     "cancelledAt", Timestamp.now(),
@@ -103,6 +105,26 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
                 )
             }
         }
+    }
+    fun prepareAdditionalReceive() {
+        val id = sessionId ?: run { error = "기존 수신 세션을 찾지 못했어요. 다시 받아 주세요."; return }
+        db.runTransaction { tx ->
+            val liveSession = tx.get(db.collection("transferSessions").document(id))
+            if (liveSession.getString("status") != "used") {
+                throw IllegalStateException("추가 수신 세션을 준비할 수 없어요. 다시 시도해 주세요.")
+            }
+            tx.update(
+                db.collection("transferSessions").document(id),
+                "status", "ready_for_more",
+                "amount", 0,
+                "deliveredCount", 0,
+                "expiresAt", Timestamp(Date(System.currentTimeMillis() + 60_000)),
+                "receiverReadyAt", Timestamp.now(),
+                "cleanupAt", com.google.firebase.firestore.FieldValue.delete(),
+            )
+            null
+        }.addOnSuccessListener { status = "ready_for_more" }
+            .addOnFailureListener { error = it.message ?: "추가 수신을 준비하지 못했어요." }
     }
     BackHandler { cancelSession(); onBack() }
 
@@ -120,11 +142,15 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
         bleToken = null
         status = "creating"
         receivedAmount = null
+        deliveredCount = 0L
         sessionTheme = null
         val uid = FirebaseAuth.getInstance().currentUser?.uid
         if (uid == null) { error = "사용자 정보를 찾지 못했어요."; return@LaunchedEffect }
         val oldSessions = db.collection("transferSessions").whereEqualTo("receiverId", uid).get().await()
-        oldSessions.documents.filter { it.getString("status") == "active" || it.getString("status") == "claimed" }
+        oldSessions.documents.filter {
+            it.getString("status") == "active" || it.getString("status") == "claimed" ||
+                it.getString("status") == "reopened" || it.getString("status") == "ready_for_more"
+        }
             .forEach {
                 it.reference.update(
                     "status", "cancelled",
@@ -156,10 +182,11 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
             val newStatus = snapshot?.getString("status") ?: return@addSnapshotListener
             status = newStatus
             receivedAmount = snapshot.getLong("amount")
+            deliveredCount = snapshot.getLong("deliveredCount") ?: 0L
             snapshot.getString("visualTheme")?.let { savedTheme ->
                 sessionTheme = VisualTheme.entries.firstOrNull { it.name == savedTheme }
             }
-            if (newStatus == "claimed") {
+            if (newStatus == "claimed" || newStatus == "reopened" || newStatus == "ready_for_more") {
                 val expiresAt = snapshot.getTimestamp("expiresAt")?.toDate()?.time ?: (System.currentTimeMillis() + 60_000)
                 secondsLeft = ((expiresAt - System.currentTimeMillis()).coerceAtLeast(0) / 1000).toInt()
             }
@@ -168,9 +195,9 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
     }
 
     LaunchedEffect(status, sessionId) {
-        if (status != "claimed") return@LaunchedEffect
-        while (secondsLeft > 0 && status == "claimed") { delay(1_000); secondsLeft -= 1 }
-        if (status == "claimed" && sessionId != null) {
+        if (status != "claimed" && status != "reopened" && status != "ready_for_more") return@LaunchedEffect
+        while (secondsLeft > 0 && (status == "claimed" || status == "reopened" || status == "ready_for_more")) { delay(1_000); secondsLeft -= 1 }
+        if ((status == "claimed" || status == "reopened" || status == "ready_for_more") && sessionId != null) {
             db.collection("transferSessions").document(sessionId!!).update(
                 "status", "expired",
                 "expiredAt", Timestamp.now(),
@@ -188,8 +215,8 @@ fun ReceiveScreen(theme: VisualTheme, onBack: () -> Unit, onBackgroundExit: () -
 
     val displayedTheme = sessionTheme ?: theme
     when (status) {
-        "claimed" -> ReceivingWaitScreen(theme = displayedTheme, secondsLeft = secondsLeft, onCancel = { cancelSession(); refreshKey += 1 })
-        "used" -> ReceiveCompleteScreen(theme = displayedTheme, amount = receivedAmount ?: 0L, onHome = onBack, onReceiveMore = { refreshKey += 1 })
+        "claimed", "reopened", "ready_for_more" -> ReceivingWaitScreen(theme = displayedTheme, secondsLeft = secondsLeft, deliveredCount = deliveredCount, onCancel = { cancelSession(); refreshKey += 1 })
+        "used" -> ReceiveCompleteScreen(theme = displayedTheme, amount = receivedAmount ?: 0L, onHome = onBack, onReceiveMore = { prepareAdditionalReceive() })
         else -> if (bleMode) {
             BleReadyScreen(
                 theme = displayedTheme,
@@ -327,16 +354,45 @@ private fun BleReadyScreen(theme: VisualTheme, sessionId: String?, onUseNfc: () 
 }
 
 @Composable
-private fun ReceivingWaitScreen(theme: VisualTheme, secondsLeft: Int, onCancel: () -> Unit) {
+private fun ReceivingWaitScreen(theme: VisualTheme, secondsLeft: Int, deliveredCount: Long, onCancel: () -> Unit) {
     Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text("수신 대기 중", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(18.dp))
-        Text("↓", color = theme.primary, fontSize = 90.sp)
-        Text("상대방이 재화를 보내는 중이에요.", textAlign = TextAlign.Center)
+        Box(Modifier.fillMaxWidth().height(150.dp), contentAlignment = Alignment.Center) {
+            if (deliveredCount > 0) {
+                key(deliveredCount) { IncomingTokenSequence(theme) }
+            } else {
+                Text("↓", color = theme.primary, fontSize = 90.sp)
+            }
+        }
+        Text(
+            if (deliveredCount > 0) "재화 ${deliveredCount}개가 도착했어요. 계속 받을 수 있어요."
+            else "상대방이 재화를 보내는 중이에요.",
+            textAlign = TextAlign.Center,
+        )
         Spacer(Modifier.height(12.dp))
         Text("남은 시간 00:${secondsLeft.toString().padStart(2, '0')}", color = Color(0xFF64748B))
         Spacer(Modifier.height(30.dp))
         ThemeButton(theme = theme, onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("수신 취소") }
+    }
+}
+
+@Composable
+private fun IncomingTokenSequence(theme: VisualTheme) {
+    when (theme) {
+        VisualTheme.GOLD -> GoldCoinLandingSequence(1)
+        VisualTheme.ROCKET -> RocketLanding()
+        VisualTheme.FLOWER -> FlowerLanding()
+        VisualTheme.HEART_BALLOON -> HeartBalloonLanding()
+        VisualTheme.PAPER_PLANE -> PaperPlaneLanding()
+        VisualTheme.PURPLE -> {
+            var landed by remember { mutableStateOf(false) }
+            val y by animateDpAsState(if (landed) 0.dp else (-220).dp, tween(620), label = "purpleTokenIncoming")
+            LaunchedEffect(Unit) { landed = true }
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                PurpleToken(Modifier.offset(y = y), size = 78.dp)
+            }
+        }
     }
 }
 
@@ -368,8 +424,12 @@ private fun ReceiveCompleteScreen(theme: VisualTheme, amount: Long, onHome: () -
                 GoldCoinLandingSequence(amount.toInt())
             } else if (theme == VisualTheme.ROCKET) {
                 RocketLanding()
-            } else if (theme == VisualTheme.PARTICLE) {
-                ParticleGatheringSequence(theme)
+            } else if (theme == VisualTheme.FLOWER) {
+                FlowerLanding()
+            } else if (theme == VisualTheme.HEART_BALLOON) {
+                HeartBalloonLanding()
+            } else if (theme == VisualTheme.PAPER_PLANE) {
+                PaperPlaneLanding()
             } else {
                 Column(
                     Modifier.offset(y = coinOffset),
@@ -394,28 +454,35 @@ private fun ReceiveCompleteScreen(theme: VisualTheme, amount: Long, onHome: () -
 }
 
 @Composable
-private fun ParticleGatheringSequence(theme: VisualTheme) {
+private fun HeartBalloonLanding() {
+    var landed by remember { mutableStateOf(false) }
+    val y by animateDpAsState(if (landed) 0.dp else (-240).dp, tween(760), label = "heartBalloonLandingY")
+    val x by animateDpAsState(if (landed) 0.dp else 38.dp, tween(760), label = "heartBalloonLandingX")
+    LaunchedEffect(Unit) { landed = true }
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        repeat(16) { index ->
-            var gathered by remember { mutableStateOf(false) }
-            val startX = ((index % 4) - 1.5f) * 48f
-            val startY = ((index / 4) - 1.5f) * 42f
-            val x by animateDpAsState(if (gathered) 0.dp else startX.dp, tween(620), label = "gatherX$index")
-            val y by animateDpAsState(if (gathered) 0.dp else startY.dp, tween(620), label = "gatherY$index")
-            val alpha by animateFloatAsState(if (gathered) 1f else .3f, tween(520), label = "gatherAlpha$index")
-            LaunchedEffect(Unit) { delay(index * 32L); gathered = true }
-            ParticleDot(
-                modifier = Modifier.offset(x = x, y = y).alpha(alpha),
-                size = if (index % 3 == 0) 16.dp else 11.dp,
-                color = if (index % 2 == 0) theme.sparkle else theme.primary,
-            )
-        }
-        Box(
-            Modifier.size(70.dp).background(theme.primary.copy(alpha = .14f), CircleShape),
-            contentAlignment = Alignment.Center,
-        ) {
-            ParticleDot(size = 28.dp, color = theme.sparkle)
-        }
+        HeartBalloon(Modifier.offset(x = x, y = y), size = 88.dp)
+    }
+}
+
+@Composable
+private fun PaperPlaneLanding() {
+    var landed by remember { mutableStateOf(false) }
+    val x by animateDpAsState(if (landed) 0.dp else (-280).dp, tween(700), label = "paperPlaneLandingX")
+    val y by animateDpAsState(if (landed) 0.dp else (-170).dp, tween(700), label = "paperPlaneLandingY")
+    LaunchedEffect(Unit) { landed = true }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        PaperPlane(Modifier.offset(x = x, y = y), size = 88.dp)
+    }
+}
+
+@Composable
+private fun FlowerLanding() {
+    var landed by remember { mutableStateOf(false) }
+    val y by animateDpAsState(if (landed) 0.dp else (-240).dp, tween(760), label = "flowerLandingY")
+    val rotation by animateFloatAsState(if (landed) 0f else (-420f), tween(760), label = "flowerLandingRotation")
+    LaunchedEffect(Unit) { landed = true }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        FlowerToken(Modifier.offset(y = y).rotate(rotation), size = 94.dp)
     }
 }
 

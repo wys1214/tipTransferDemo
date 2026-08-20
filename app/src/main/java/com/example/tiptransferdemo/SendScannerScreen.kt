@@ -10,6 +10,7 @@ import android.nfc.tech.IsoDep
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
+import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -33,6 +34,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
@@ -59,6 +61,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -100,12 +103,47 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
     var session by remember { mutableStateOf<ReceiverSession?>(null) }
     var amount by remember { mutableStateOf(1) }
     var isReadyToSend by remember { mutableStateOf(false) }
-    var isSending by remember { mutableStateOf(false) }
     var isComplete by remember { mutableStateOf(false) }
+    var isReopeningSession by remember { mutableStateOf(false) }
+    // 화면 스와이프는 즉시 반응시키고, 서버 반영만 내부 대기열에서 순서대로 처리한다.
+    var queuedTokenCount by remember { mutableStateOf(0) }
+    var tokenRequestInFlight by remember { mutableStateOf(false) }
+    var allTokensQueued by remember { mutableStateOf(false) }
+    var isFinalizing by remember { mutableStateOf(false) }
+    var sendAnimationFinished by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     // 기본 전송 방식은 NFC이며, 필요할 때 주변 BLE/QR로 전환한다.
     var useNfc by remember { mutableStateOf(true) }
     var useBle by remember { mutableStateOf(false) }
+
+    LaunchedEffect(queuedTokenCount, tokenRequestInFlight, allTokensQueued, sendAnimationFinished, isFinalizing, session) {
+        val activeSession = session ?: return@LaunchedEffect
+        if (queuedTokenCount > 0 && !tokenRequestInFlight && !isFinalizing) {
+            tokenRequestInFlight = true
+            transferOne(activeSession, amount,
+                onSuccess = {
+                    queuedTokenCount -= 1
+                    tokenRequestInFlight = false
+                },
+                onError = {
+                    tokenRequestInFlight = false
+                    queuedTokenCount = 0
+                    allTokensQueued = false
+                    isReadyToSend = false
+                    session = null
+                    message = it
+                },
+            )
+        } else if (allTokensQueued && queuedTokenCount == 0 && !tokenRequestInFlight && sendAnimationFinished && !isFinalizing) {
+            isFinalizing = true
+            finalizeTransfer(activeSession, amount,
+                // 완료 성공 후에는 대기열 완료 플래그도 해제한다. 그렇지 않으면
+                // 재구성 시 같은 완료 요청이 한 번 더 실행될 수 있다.
+                onSuccess = { allTokensQueued = false; isFinalizing = false; isComplete = true },
+                onError = { allTokensQueued = false; isFinalizing = false; isReadyToSend = false; message = it },
+            )
+        }
+    }
 
     BackHandler {
         when {
@@ -116,24 +154,45 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
     }
 
     when {
-        isComplete -> TransferCompleteScreen(amount = amount, theme = theme, onHome = onBack, onSendMore = {
-            session = null
-            amount = 1
-            isComplete = false
-            useNfc = true
-            useBle = false
-        })
+        isComplete -> TransferCompleteScreen(
+            amount = amount,
+            theme = theme,
+            isPreparingMore = isReopeningSession,
+            onHome = onBack,
+            onSendMore = {
+                val currentSession = session
+                if (currentSession == null) {
+                    message = "추가 전송 세션을 찾지 못했어요. 다시 연결해 주세요."
+                } else {
+                    isReopeningSession = true
+                    reopenTransferSession(currentSession, theme,
+                        onSuccess = {
+                            amount = 1
+                            isComplete = false
+                            isReadyToSend = false
+                            isReopeningSession = false
+                            queuedTokenCount = 0
+                            tokenRequestInFlight = false
+                            allTokensQueued = false
+                            isFinalizing = false
+                            sendAnimationFinished = false
+                        },
+                        onError = { isReopeningSession = false; message = it },
+                    )
+                }
+            },
+        )
         isReadyToSend && session != null -> SendGestureScreen(
             amount = amount,
             theme = theme,
-            isSending = isSending,
+            isSending = isFinalizing,
             onBack = { isReadyToSend = false },
-            onSend = {
-                isSending = true
-                transfer(session!!, amount,
-                    onSuccess = { isSending = false; isComplete = true },
-                    onError = { isSending = false; isReadyToSend = false; session = null; message = it },
-                )
+            onSendToken = { isFinalToken ->
+                queuedTokenCount += 1
+                if (isFinalToken) allTokensQueued = true
+            },
+            onLaunchAnimationFinished = {
+                sendAnimationFinished = true
             },
         )
         session != null -> AmountScreen(
@@ -142,7 +201,14 @@ fun SendScannerScreen(theme: VisualTheme, onBack: () -> Unit) {
             amount = amount,
             theme = theme,
             onAmountChange = { amount = it },
-            onConfirm = { isReadyToSend = true },
+            onConfirm = {
+                queuedTokenCount = 0
+                tokenRequestInFlight = false
+                allTokensQueued = false
+                isFinalizing = false
+                sendAnimationFinished = false
+                isReadyToSend = true
+            },
             onBack = { session = null },
         )
         useBle -> BleFinderScreen(
@@ -489,90 +555,139 @@ private fun AmountScreen(
 }
 
 @Composable
-private fun SendGestureScreen(amount: Int, theme: VisualTheme, isSending: Boolean, onBack: () -> Unit, onSend: () -> Unit) {
-    var launchStarted by remember { mutableStateOf(false) }
+private fun SendGestureScreen(
+    amount: Int,
+    theme: VisualTheme,
+    isSending: Boolean,
+    onBack: () -> Unit,
+    onSendToken: (isFinalToken: Boolean) -> Unit,
+    onLaunchAnimationFinished: () -> Unit,
+) {
+    val view = LocalView.current
+    var completedSwipes by remember { mutableStateOf(0) }
+    var launchKey by remember { mutableStateOf(0) }
+    var finalLaunchKey by remember { mutableStateOf(0) }
+    var swipeConsumed by remember { mutableStateOf(false) }
     // 드래그 이벤트 한 번의 이동량이 아니라 누적 이동량을 사용한다.
     // 손가락 이동을 즉시 그래픽에 반영해 잠금 해제처럼 반응하게 한다.
     var dragOffsetY by remember { mutableStateOf(0f) }
     val dragVisualOffset = dragOffsetY.coerceIn(-140f, 0f).dp
-    val tokenOffset by animateDpAsState(
-        targetValue = if (launchStarted && theme == VisualTheme.PURPLE) (-760).dp else 0.dp,
-        animationSpec = tween(durationMillis = 620),
-        label = "sendPurpleTokenLaunch",
-    )
-    val tokenRotation by animateFloatAsState(
-        targetValue = if (launchStarted && theme == VisualTheme.GOLD) 720f else 0f,
-        animationSpec = tween(durationMillis = 480),
-        label = "goldCoinRotation",
-    )
-    LaunchedEffect(launchStarted) {
-        if (launchStarted) {
-            delay(
-                when (theme) {
-                    VisualTheme.GOLD -> 800L + (amount - 1) * 110L
-                    VisualTheme.ROCKET -> 900L
-                    VisualTheme.PARTICLE -> 720L
-                    else -> 650L
-                },
-            )
-            onSend()
-        }
+    LaunchedEffect(launchKey) {
+        if (launchKey == 0) return@LaunchedEffect
+        delay(
+            when (theme) {
+                VisualTheme.ROCKET -> 900L
+                VisualTheme.FLOWER -> 760L
+                VisualTheme.HEART_BALLOON -> 760L
+                VisualTheme.PAPER_PLANE -> 700L
+                else -> 650L
+            },
+        )
+        if (launchKey == finalLaunchKey) onLaunchAnimationFinished()
     }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(20.dp, Alignment.CenterVertically),
     ) {
-        if (!launchStarted) {
+        if (completedSwipes < amount) {
             Text("전송 대기 중", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-            Text("상대방에게 ${amount}개를 보낼 준비가 되었어요.", color = Color(0xFF64748B))
+            Text("${amount}개가 준비됐어요. 한 번씩 밀어 보내세요.", color = Color(0xFF64748B))
             Text("↑", color = theme.primary, fontSize = 90.sp)
         }
         Box(
-            Modifier.fillMaxWidth().height(260.dp).pointerInput(isSending, launchStarted) {
+            Modifier.fillMaxWidth().height(260.dp).pointerInput(isSending, completedSwipes) {
                 detectVerticalDragGestures(
-                    onDragStart = { dragOffsetY = 0f },
-                    onDragEnd = { if (!launchStarted) dragOffsetY = 0f },
+                    onDragStart = { dragOffsetY = 0f; swipeConsumed = false },
+                    onDragEnd = { dragOffsetY = 0f; swipeConsumed = false },
+                    onDragCancel = { dragOffsetY = 0f; swipeConsumed = false },
                     onVerticalDrag = { _, dragAmount ->
-                        if (!isSending && !launchStarted) {
+                        if (!isSending && !swipeConsumed && completedSwipes < amount) {
                             dragOffsetY = (dragOffsetY + dragAmount).coerceAtMost(0f)
                             if (dragOffsetY <= -64f) {
-                                launchStarted = true
                                 dragOffsetY = 0f
+                                swipeConsumed = true
+                                completedSwipes += 1
+                                launchKey += 1
+                                view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                                // 한 번의 스와이프가 재화 한 개의 실제 전송과 연결된다.
+                                // 마지막 재화는 연출이 끝난 다음 수신 완료 상태로 전환한다.
+                                val isFinalToken = completedSwipes == amount
+                                if (isFinalToken) {
+                                    finalLaunchKey = launchKey
+                                }
+                                onSendToken(isFinalToken)
                             }
                         }
                     },
                 )
             }, contentAlignment = Alignment.Center,
         ) {
-            if (theme == VisualTheme.PURPLE && launchStarted) {
-                PurpleToken(Modifier.offset(y = tokenOffset), size = 100.dp)
-            } else if (theme == VisualTheme.GOLD && launchStarted) {
-                GoldCoinLaunchSequence(amount)
-            } else if (theme == VisualTheme.ROCKET && launchStarted) {
-                RocketLaunchSequence()
-            } else if (theme == VisualTheme.PARTICLE && launchStarted) {
-                ParticleBurstLaunchSequence(theme)
-            } else if (isSending) {
-                CircularProgressIndicator(color = if (theme == VisualTheme.PURPLE) Color.White else theme.primary)
-            } else {
-                Column(
-                    modifier = Modifier.offset(y = dragVisualOffset),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                ) {
-                    if (theme == VisualTheme.GOLD) GoldCoin(Modifier.rotate(tokenRotation), size = 76.dp)
-                    else if (theme == VisualTheme.ROCKET) RocketShip(size = 96.dp)
-                    else if (theme == VisualTheme.PURPLE) PurpleToken(size = 94.dp)
-                    else Text(theme.token, color = theme.primary, fontSize = 92.sp, modifier = Modifier.rotate(tokenRotation))
-                    Text(
-                        "${amount}개\n위로 밀어 보내기",
-                        color = theme.primary,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                    )
+            Column(
+                modifier = Modifier.offset(y = dragVisualOffset),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                TokenStack(theme = theme, remaining = amount - completedSwipes)
+                Text(
+                    "${completedSwipes} / ${amount}개\n위로 밀어 보내기",
+                    color = theme.primary,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                )
+            }
+            if (launchKey > 0) {
+                key(launchKey) { SingleTokenLaunchSequence(theme) }
+            }
+            if (isSending) {
+                CircularProgressIndicator(
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp).size(22.dp),
+                    strokeWidth = 2.dp,
+                    color = theme.primary,
+                )
+            }
+        }
+        Text(
+            "한 번 밀 때마다 재화 1개가 전달돼요.",
+            color = Color(0xFF64748B),
+            fontSize = 13.sp,
+        )
+        ThemeButton(theme = theme, onClick = onBack, enabled = !isSending, modifier = Modifier.fillMaxWidth()) { Text("이전") }
+    }
+}
+
+@Composable
+private fun TokenStack(theme: VisualTheme, remaining: Int) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        if (remaining == 0) {
+            Text("모든 재화를 보냈어요", color = Color(0xFF64748B), fontSize = 14.sp)
+        } else {
+            val tokenCount = remaining.coerceAtMost(MAX_TRANSFER_AMOUNT)
+            for (start in 0 until tokenCount step 5) {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    repeat(minOf(5, tokenCount - start)) {
+                        when (theme) {
+                            VisualTheme.GOLD -> GoldCoin(size = 34.dp)
+                            VisualTheme.ROCKET -> RocketShip(size = 38.dp)
+                            VisualTheme.PURPLE -> PurpleToken(size = 38.dp)
+                            VisualTheme.FLOWER -> FlowerToken(size = 38.dp)
+                            VisualTheme.HEART_BALLOON -> HeartBalloon(size = 36.dp)
+                            VisualTheme.PAPER_PLANE -> PaperPlane(size = 40.dp)
+                        }
+                    }
                 }
             }
         }
-        ThemeButton(theme = theme, onClick = onBack, enabled = !isSending && !launchStarted, modifier = Modifier.fillMaxWidth()) { Text("이전") }
+    }
+}
+
+@Composable
+private fun SingleTokenLaunchSequence(theme: VisualTheme) {
+    when (theme) {
+        VisualTheme.PURPLE -> PurpleTokenLaunchSequence()
+        VisualTheme.GOLD -> GoldCoinLaunchSequence(1)
+        VisualTheme.ROCKET -> RocketLaunchSequence()
+        VisualTheme.FLOWER -> FlowerLaunchSequence()
+        VisualTheme.HEART_BALLOON -> HeartBalloonLaunchSequence()
+        VisualTheme.PAPER_PLANE -> PaperPlaneLaunchSequence()
     }
 }
 
@@ -597,6 +712,16 @@ fun PurpleToken(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp
                     .size(size * .13f).background(Color.White.copy(alpha = .78f), CircleShape),
             )
         }
+    }
+}
+
+@Composable
+private fun PurpleTokenLaunchSequence() {
+    var launched by remember { mutableStateOf(false) }
+    val y by animateDpAsState(if (launched) (-760).dp else 30.dp, tween(650), label = "purpleTokenLaunch")
+    LaunchedEffect(Unit) { launched = true }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        PurpleToken(Modifier.offset(y = y), size = 100.dp)
     }
 }
 
@@ -697,34 +822,88 @@ fun RocketShip(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp 
 }
 
 @Composable
-private fun ParticleBurstLaunchSequence(theme: VisualTheme) {
-    var burst by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { burst = true }
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        repeat(16) { index ->
-            val xTarget = ((index % 4) - 1.5f) * 54f
-            val yTarget = ((index / 4) - 1.5f) * 52f - 92f
-            val x by animateDpAsState(if (burst) xTarget.dp else 0.dp, tween(680), label = "particleX$index")
-            val y by animateDpAsState(if (burst) yTarget.dp else 0.dp, tween(680), label = "particleY$index")
-            val alpha by animateFloatAsState(if (burst) .28f else 1f, tween(680), label = "particleAlpha$index")
-            ParticleDot(
-                modifier = Modifier.offset(x = x, y = y).alpha(alpha),
-                size = if (index % 3 == 0) 15.dp else 10.dp,
-                color = if (index % 2 == 0) theme.sparkle else theme.primary,
+fun HeartBalloon(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 72.dp) {
+    Box(modifier.size(size * .86f, size * 1.25f), contentAlignment = Alignment.TopCenter) {
+        Box(
+            Modifier.size(size * .86f).background(
+                Brush.radialGradient(listOf(Color(0xFFFDA4AF), Color(0xFFEC4899), Color(0xFF9D174D))),
+                CircleShape,
+            ).border(1.5.dp, Color(0xFFFFE4E6), CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("♥", color = Color.White, fontSize = (size.value * .42f).sp, fontWeight = FontWeight.Bold)
+            Box(
+                Modifier.align(Alignment.TopStart).padding(start = size * .16f, top = size * .15f)
+                    .size(size * .12f).background(Color.White.copy(alpha = .72f), CircleShape),
             )
         }
+        Box(
+            Modifier.align(Alignment.BottomCenter).width(1.dp).height(size * .45f)
+                .background(Color(0xFFBE185D).copy(alpha = .7f)),
+        )
     }
 }
 
 @Composable
-fun ParticleDot(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 12.dp, color: Color = Color(0xFF67E8F9)) {
+fun PaperPlane(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 72.dp) {
     Box(
-        modifier.size(size * 1.7f).background(color.copy(alpha = .18f), CircleShape),
+        modifier.size(size, size * .74f)
+            .background(Brush.linearGradient(listOf(Color(0xFFE0F2FE), Color(0xFF38BDF8), Color(0xFF0369A1))), RoundedCornerShape(8.dp))
+            .border(1.dp, Color(0xFFE0F2FE), RoundedCornerShape(8.dp))
+            .rotate(-18f),
         contentAlignment = Alignment.Center,
     ) {
+        Text("➤", color = Color.White, fontSize = (size.value * .55f).sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun HeartBalloonLaunchSequence() {
+    var launched by remember { mutableStateOf(false) }
+    val y by animateDpAsState(if (launched) (-760).dp else 50.dp, tween(760), label = "heartBalloonLaunch")
+    val x by animateDpAsState(if (launched) 42.dp else 0.dp, tween(760), label = "heartBalloonDrift")
+    LaunchedEffect(Unit) { launched = true }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        HeartBalloon(Modifier.offset(x = x, y = y), size = 88.dp)
+    }
+}
+
+@Composable
+private fun PaperPlaneLaunchSequence() {
+    var launched by remember { mutableStateOf(false) }
+    val x by animateDpAsState(if (launched) 340.dp else (-35).dp, tween(700), label = "paperPlaneLaunchX")
+    val y by animateDpAsState(if (launched) (-530).dp else 54.dp, tween(700), label = "paperPlaneLaunchY")
+    LaunchedEffect(Unit) { launched = true }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        PaperPlane(Modifier.offset(x = x, y = y), size = 100.dp)
+    }
+}
+
+@Composable
+fun FlowerToken(modifier: Modifier = Modifier, size: androidx.compose.ui.unit.Dp = 72.dp) {
+    Box(modifier.size(size), contentAlignment = Alignment.Center) {
+        val petalSize = size * .42f
+        val petalColor = Color(0xFFE879F9)
+        Box(Modifier.align(Alignment.TopCenter).size(petalSize).background(petalColor, CircleShape))
+        Box(Modifier.align(Alignment.BottomCenter).size(petalSize).background(Color(0xFFD946EF), CircleShape))
+        Box(Modifier.align(Alignment.CenterStart).size(petalSize).background(Color(0xFFF0ABFC), CircleShape))
+        Box(Modifier.align(Alignment.CenterEnd).size(petalSize).background(Color(0xFFF0ABFC), CircleShape))
+        Box(Modifier.size(petalSize).rotate(45f).background(Color(0xFFE879F9), CircleShape))
         Box(
-            Modifier.size(size).background(Brush.radialGradient(listOf(Color.White, color)), CircleShape),
+            Modifier.size(size * .30f).background(Brush.radialGradient(listOf(Color(0xFFFFF7AE), Color(0xFFF59E0B))), CircleShape)
+                .border(1.dp, Color(0xFFFFE7A3), CircleShape),
         )
+    }
+}
+
+@Composable
+private fun FlowerLaunchSequence() {
+    var launched by remember { mutableStateOf(false) }
+    val y by animateDpAsState(if (launched) (-740).dp else 42.dp, tween(760), label = "flowerLaunchY")
+    val rotation by animateFloatAsState(if (launched) 540f else 0f, tween(760), label = "flowerLaunchRotation")
+    LaunchedEffect(Unit) { launched = true }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        FlowerToken(Modifier.offset(y = y).rotate(rotation), size = 94.dp)
     }
 }
 
@@ -742,7 +921,13 @@ fun RocketLanding() {
 }
 
 @Composable
-private fun TransferCompleteScreen(amount: Int, theme: VisualTheme, onHome: () -> Unit, onSendMore: () -> Unit) {
+private fun TransferCompleteScreen(
+    amount: Int,
+    theme: VisualTheme,
+    isPreparingMore: Boolean,
+    onHome: () -> Unit,
+    onSendMore: () -> Unit,
+) {
     Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
         Text("전송 완료", fontSize = 28.sp, fontWeight = FontWeight.Bold)
         androidx.compose.foundation.layout.Spacer(Modifier.height(18.dp))
@@ -751,7 +936,9 @@ private fun TransferCompleteScreen(amount: Int, theme: VisualTheme, onHome: () -
         androidx.compose.foundation.layout.Spacer(Modifier.height(30.dp))
         Button(onClick = onHome, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("홈으로") }
         androidx.compose.foundation.layout.Spacer(Modifier.height(10.dp))
-        ThemeButton(theme = theme, onClick = onSendMore, modifier = Modifier.fillMaxWidth()) { Text("추가로 보내기") }
+        ThemeButton(theme = theme, onClick = onSendMore, enabled = !isPreparingMore, modifier = Modifier.fillMaxWidth()) {
+            Text(if (isPreparingMore) "추가 전송 준비 중…" else "추가로 보내기")
+        }
     }
 }
 
@@ -770,9 +957,9 @@ fun CelebrationSparkles(theme: VisualTheme) {
         Text("✦", color = theme.sparkle, fontSize = 22.sp, modifier = Modifier.align(Alignment.Center).offset(x = distance, y = (-18).dp).alpha(alpha))
         Text("✦", color = theme.primary, fontSize = 24.sp, modifier = Modifier.align(Alignment.Center).offset(x = -distance, y = 12.dp).alpha(alpha))
         Text("✦", color = theme.sparkle, fontSize = 20.sp, modifier = Modifier.align(Alignment.Center).offset(x = 28.dp, y = distance).alpha(alpha))
-        if (theme == VisualTheme.PARTICLE) {
-            Text("·", color = theme.sparkle, fontSize = 34.sp, modifier = Modifier.align(Alignment.Center).offset(x = (-34).dp, y = -distance).alpha(alpha))
-            Text("✧", color = theme.primary, fontSize = 28.sp, modifier = Modifier.align(Alignment.Center).offset(x = 44.dp, y = distance).alpha(alpha))
+        if (theme == VisualTheme.FLOWER) {
+            Text("✿", color = theme.sparkle, fontSize = 34.sp, modifier = Modifier.align(Alignment.Center).offset(x = (-34).dp, y = -distance).alpha(alpha))
+            Text("✿", color = theme.primary, fontSize = 28.sp, modifier = Modifier.align(Alignment.Center).offset(x = 44.dp, y = distance).alpha(alpha))
         }
     }
 }
@@ -809,41 +996,85 @@ private fun verifySession(
     }.addOnFailureListener { onError(it.message ?: "세션을 확인하지 못했어요."); onComplete() }
 }
 
-private fun transfer(session: ReceiverSession, amount: Int, onSuccess: () -> Unit, onError: (String) -> Unit) {
+/** 한 번의 스와이프마다 1개만 정산해 수신 화면이 즉시 반응하도록 한다. */
+private fun transferOne(session: ReceiverSession, totalAmount: Int, onSuccess: () -> Unit, onError: (String) -> Unit) {
     val auth = FirebaseAuth.getInstance()
     val sender = auth.currentUser ?: run { onError("로그인 정보를 찾을 수 없어요."); return }
     val db = FirebaseFirestore.getInstance()
     val sessionRef = db.collection("transferSessions").document(session.id)
     val senderRef = db.collection("users").document(sender.uid)
     val receiverRef = db.collection("users").document(session.receiverId)
-    val historyRef = db.collection("transactions").document()
     val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { timeZone = TimeZone.getTimeZone("Asia/Seoul") }.format(Date())
     db.runTransaction { tx ->
         val liveSession = tx.get(sessionRef)
         val senderWallet = tx.get(senderRef)
         val receiverWallet = tx.get(receiverRef)
-        val active = liveSession.getString("status") == "claimed" && liveSession.getString("senderId") == sender.uid
+        val active = (liveSession.getString("status") == "claimed" || liveSession.getString("status") == "reopened") &&
+            liveSession.getString("senderId") == sender.uid
         val unexpired = liveSession.getTimestamp("expiresAt")?.toDate()?.after(Date()) == true
         if (!active || !unexpired) throw IllegalStateException("세션이 만료되었어요. 다시 QR을 스캔해 주세요.")
+        val deliveredCount = liveSession.getLong("deliveredCount") ?: 0L
+        if (deliveredCount >= totalAmount) throw IllegalStateException("이미 모든 재화를 보냈어요.")
         val balance = senderWallet.getLong("balance") ?: 0L
-        if (balance < amount) throw IllegalStateException("보유 재화가 부족해요.")
+        if (balance < 1) throw IllegalStateException("보유 재화가 부족해요.")
         val sentToday = if (senderWallet.getString("dailyLimitDate") == today) senderWallet.getLong("dailySentAmount") ?: 0L else 0L
-        if (sentToday + amount > DAILY_SEND_LIMIT) throw IllegalStateException("하루에 보낼 수 있는 최대 수량이 초과되었어요.")
-        tx.set(senderRef, mapOf("balance" to balance - amount, "dailySentAmount" to sentToday + amount, "dailyLimitDate" to today, "updatedAt" to FieldValue.serverTimestamp()), SetOptions.merge())
-        tx.set(receiverRef, mapOf("balance" to (receiverWallet.getLong("balance") ?: 0L) + amount, "updatedAt" to FieldValue.serverTimestamp()), SetOptions.merge())
+        if (sentToday + 1 > DAILY_SEND_LIMIT) throw IllegalStateException("하루에 보낼 수 있는 최대 수량이 초과되었어요.")
+        tx.set(senderRef, mapOf("balance" to balance - 1, "dailySentAmount" to sentToday + 1, "dailyLimitDate" to today, "updatedAt" to FieldValue.serverTimestamp()), SetOptions.merge())
+        tx.set(receiverRef, mapOf("balance" to (receiverWallet.getLong("balance") ?: 0L) + 1, "updatedAt" to FieldValue.serverTimestamp()), SetOptions.merge())
         tx.update(
             sessionRef,
-            "status", "used",
-            "usedAt", FieldValue.serverTimestamp(),
-            "cleanupAt", terminalSessionCleanupAt(),
-            "senderId", sender.uid,
-            "amount", amount,
+            "deliveredCount", deliveredCount + 1,
+            "amount", totalAmount,
+            "lastDeliveredAt", FieldValue.serverTimestamp(),
         )
-        tx.set(historyRef, mapOf("senderId" to sender.uid, "receiverId" to session.receiverId, "amount" to amount, "type" to "transfer", "createdAt" to FieldValue.serverTimestamp()))
         null
     }.addOnSuccessListener { onSuccess() }.addOnFailureListener { error ->
         onError(transferFailureMessage(error))
     }
+}
+
+private fun finalizeTransfer(session: ReceiverSession, amount: Int, onSuccess: () -> Unit, onError: (String) -> Unit) {
+    val sender = FirebaseAuth.getInstance().currentUser ?: run { onError("로그인 정보를 찾을 수 없어요."); return }
+    val db = FirebaseFirestore.getInstance()
+    val sessionRef = db.collection("transferSessions").document(session.id)
+    val historyRef = db.collection("transactions").document()
+    db.runTransaction { tx ->
+        val liveSession = tx.get(sessionRef)
+        val active = (liveSession.getString("status") == "claimed" || liveSession.getString("status") == "reopened") &&
+            liveSession.getString("senderId") == sender.uid
+        val deliveredCount = liveSession.getLong("deliveredCount") ?: 0L
+        if (!active || deliveredCount != amount.toLong()) throw IllegalStateException("전송 상태를 확인하지 못했어요.")
+        tx.update(sessionRef, "status", "used", "usedAt", FieldValue.serverTimestamp(), "cleanupAt", terminalSessionCleanupAt(), "amount", amount)
+        tx.set(historyRef, mapOf("senderId" to sender.uid, "receiverId" to session.receiverId, "amount" to amount, "type" to "transfer", "createdAt" to FieldValue.serverTimestamp()))
+        null
+    }.addOnSuccessListener { onSuccess() }.addOnFailureListener { onError(transferFailureMessage(it)) }
+}
+
+/**
+ * 완료된 세션을 같은 송신자만 다시 열 수 있게 한다.
+ * 수신자는 기존 화면에서 바로 수신 대기 상태로 돌아가므로 재연결 과정이 필요 없다.
+ */
+private fun reopenTransferSession(session: ReceiverSession, theme: VisualTheme, onSuccess: () -> Unit, onError: (String) -> Unit) {
+    val sender = FirebaseAuth.getInstance().currentUser ?: run { onError("로그인 정보를 찾을 수 없어요."); return }
+    val db = FirebaseFirestore.getInstance()
+    val sessionRef = db.collection("transferSessions").document(session.id)
+    db.runTransaction { tx ->
+        val liveSession = tx.get(sessionRef)
+        val canReopen = (liveSession.getString("status") == "used" || liveSession.getString("status") == "ready_for_more") &&
+            liveSession.getString("senderId") == sender.uid
+        if (!canReopen) throw IllegalStateException("추가 전송 세션을 다시 열 수 없어요. 다시 연결해 주세요.")
+        tx.update(
+            sessionRef,
+            "status", "reopened",
+            "visualTheme", theme.name,
+            "amount", 0,
+            "deliveredCount", 0,
+            "expiresAt", Timestamp(Date(System.currentTimeMillis() + 60_000)),
+            "reopenedAt", FieldValue.serverTimestamp(),
+            "cleanupAt", FieldValue.delete(),
+        )
+        null
+    }.addOnSuccessListener { onSuccess() }.addOnFailureListener { onError(transferFailureMessage(it)) }
 }
 
 private fun transferFailureMessage(error: Exception): String {

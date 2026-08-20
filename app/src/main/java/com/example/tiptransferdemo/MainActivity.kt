@@ -9,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -286,10 +288,22 @@ private fun App(
             onDismissRequest = { showThemeDialog = false },
             title = { Text("전송 효과 테마") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    VisualTheme.entries.forEach { theme ->
-                        ThemeButton(theme = theme, onClick = { visualTheme = theme; saveTheme(context, theme); showThemeDialog = false }, modifier = Modifier.fillMaxWidth()) {
-                            Text("${theme.displayName} · ${theme.description}")
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    VisualTheme.entries.toList().chunked(3).forEach { rowThemes ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            rowThemes.forEach { candidate ->
+                                ThemeChoiceCard(
+                                    theme = candidate,
+                                    selected = candidate == visualTheme,
+                                    onClick = {
+                                        visualTheme = candidate
+                                        saveTheme(context, candidate)
+                                        showThemeDialog = false
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                            repeat(3 - rowThemes.size) { Spacer(Modifier.weight(1f)) }
                         }
                     }
                 }
@@ -390,6 +404,8 @@ private fun HomeScreen(
                 Text("안녕하세요", color = Color(0xFF64748B), fontSize = 14.sp)
                 Text(state.nickname, fontWeight = FontWeight.Bold, fontSize = 19.sp)
             }
+            Spacer(Modifier.weight(1f))
+            ThemeQuickButton(theme = theme, onClick = onThemeClick)
         }
         Card(
             colors = CardDefaults.cardColors(containerColor = theme.dark),
@@ -415,9 +431,6 @@ private fun HomeScreen(
         }
         ThemeButton(theme = theme, onClick = onTopUpClick, modifier = Modifier.fillMaxWidth().height(54.dp)) {
             Text("테스트 재화 충전")
-        }
-        ThemeButton(theme = theme, onClick = onThemeClick, modifier = Modifier.fillMaxWidth().height(48.dp)) {
-            Text("효과 테마 · ${theme.displayName}")
         }
         Text(
             "최근 내역",
@@ -458,6 +471,67 @@ private fun HomeScreen(
                 }
             }
         }
+    }
+}
+
+/** 홈에서는 현재 적용된 효과를 작은 상징 아이콘으로 보여 준다. */
+@Composable
+private fun ThemeQuickButton(theme: VisualTheme, onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.size(46.dp).clickable(onClick = onClick),
+        shape = CircleShape,
+        colors = CardDefaults.cardColors(containerColor = theme.primary.copy(alpha = .10f)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, theme.primary.copy(alpha = .38f)),
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            ThemeSymbol(theme = theme, size = 28.dp)
+        }
+    }
+}
+
+/** 텍스트 설명 대신 실제 전송 연출과 같은 상징물을 테마 선택기에 표시한다. */
+@Composable
+private fun ThemeChoiceCard(
+    theme: VisualTheme,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier.height(108.dp).clickable(onClick = onClick),
+        shape = RoundedCornerShape(22.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (selected) theme.primary.copy(alpha = .13f) else Color.White,
+        ),
+        border = androidx.compose.foundation.BorderStroke(
+            width = if (selected) 2.dp else 1.dp,
+            color = theme.primary.copy(alpha = if (selected) .95f else .28f),
+        ),
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            ThemeSymbol(theme = theme, size = 58.dp)
+            if (selected) {
+                Box(
+                    Modifier.align(Alignment.TopEnd).padding(10.dp).size(21.dp)
+                        .background(theme.primary, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("✓", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThemeSymbol(theme: VisualTheme, size: androidx.compose.ui.unit.Dp) {
+    when (theme) {
+        VisualTheme.PURPLE -> PurpleToken(size = size)
+        VisualTheme.GOLD -> GoldCoin(size = size * .92f)
+        VisualTheme.ROCKET -> RocketShip(size = size)
+        VisualTheme.FLOWER -> FlowerToken(size = size)
+        VisualTheme.HEART_BALLOON -> HeartBalloon(size = size * .88f)
+        VisualTheme.PAPER_PLANE -> PaperPlane(size = size)
     }
 }
 
