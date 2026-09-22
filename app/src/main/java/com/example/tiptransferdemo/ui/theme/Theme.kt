@@ -10,6 +10,7 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Color
 
 private val DarkColorScheme = darkColorScheme(
     primary = Purple80,
@@ -18,9 +19,16 @@ private val DarkColorScheme = darkColorScheme(
 )
 
 private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
+    primary = Color(0xFF2868F0),
+    onPrimary = Color.White,
+    secondary = Color(0xFF167D5A),
+    tertiary = Color(0xFF7C5CDB),
+    background = Color(0xFFF4F6F9),
+    surface = Color.White,
+    onBackground = Color(0xFF191F28),
+    onSurface = Color(0xFF191F28),
+    onSurfaceVariant = Color(0xFF6B7684),
+    outline = Color(0xFFB0BAC7)
 
     /* Other default colors to override
     background = Color(0xFFFFFBFE),
@@ -35,9 +43,9 @@ private val LightColorScheme = lightColorScheme(
 
 @Composable
 fun TipTransferDemoTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
+    darkTheme: Boolean = false,
+    // 금융 앱의 색상 체계를 일관되게 유지한다. 기기별 동적 색상은 사용하지 않는다.
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {

@@ -11,12 +11,12 @@ enum class VisualTheme(
     val token: String,
 ) {
     PURPLE(
-        displayName = "기본 보라",
-        description = "깔끔한 디지털 재화 테마",
-        primary = Color(0xFF4F46E5),
-        dark = Color(0xFF171B3A),
-        sparkle = Color(0xFFFDE68A),
-        token = "●",
+        displayName = "스타 벌룬",
+        description = "별을 담아 보내는 대표 후원 재화",
+        primary = Color(0xFFE83E78),
+        dark = Color(0xFF4A1830),
+        sparkle = Color(0xFFFFD76A),
+        token = "★",
     ),
     GOLD(
         displayName = "골드 코인",
@@ -59,3 +59,16 @@ enum class VisualTheme(
         token = "➤",
     ),
 }
+
+/**
+ * 사용자에게 노출하는 실제 재화 목록.
+ * PURPLE은 이전 설치/Firestore 데이터 호환을 위해 enum에는 남기되 새 선택 화면에서는 제거한다.
+ */
+val selectableVisualThemes = listOf(
+    VisualTheme.PURPLE,
+    VisualTheme.GOLD,
+    VisualTheme.ROCKET,
+    VisualTheme.FLOWER,
+    VisualTheme.HEART_BALLOON,
+    VisualTheme.PAPER_PLANE,
+)

@@ -40,6 +40,7 @@ fun BleFinderScreen(
     onHome: () -> Unit,
 ) {
     val context = LocalContext.current
+    val pack = LocalUiThemePack.current
     val adapter = remember { BluetoothAdapter.getDefaultAdapter() }
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val candidates = remember { mutableStateListOf<ScanResult>() }
@@ -183,11 +184,11 @@ fun BleFinderScreen(
             }
         })
     }
-    Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-        Text("가까운 사람 찾기", color = theme.primary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(12.dp)); Text(message, color = Color(0xFF64748B), textAlign = TextAlign.Center)
+    Column(Modifier.fillMaxSize().themeAtmosphere(pack).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Text("가까운 사람 찾기", color = pack.accent, fontSize = 28.sp, fontWeight = FontWeight.Bold, fontFamily = pack.fontFamily)
+        Spacer(Modifier.height(12.dp)); Text(message, color = pack.muted, textAlign = TextAlign.Center)
         Spacer(Modifier.height(22.dp))
-        if (candidates.isEmpty()) Text("수신자가 ‘주변에서 받기’를 열면 여기에 표시돼요.", textAlign = TextAlign.Center)
+        if (candidates.isEmpty()) Text("수신자가 ‘주변에서 받기’를 열면 여기에 표시돼요.", color = pack.ink, textAlign = TextAlign.Center)
         candidates.forEachIndexed { index, candidate ->
             val candidateToken = candidate.scanRecord
                 ?.getManufacturerSpecificData(BleSessionHost.MANUFACTURER_ID)
@@ -226,13 +227,13 @@ fun BleFinderScreen(
             Button(
                 onClick = onUseQr,
                 modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = theme.primary),
+                colors = ButtonDefaults.buttonColors(containerColor = pack.accent),
             ) { Text("QR로 바로 연결") }
         } else {
             ThemeButton(theme = theme, onClick = onUseQr, modifier = Modifier.fillMaxWidth()) { Text("QR로 보내기") }
         }
         Spacer(Modifier.height(10.dp))
-        Button(onClick = onHome, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = theme.primary)) { Text("홈으로") }
+        Button(onClick = onHome, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = pack.accent)) { Text("홈으로") }
     }
 }
 

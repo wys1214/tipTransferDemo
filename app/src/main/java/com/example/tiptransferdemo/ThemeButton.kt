@@ -19,15 +19,19 @@ fun ThemeButton(
     enabled: Boolean = true,
     content: @Composable RowScope.() -> Unit,
 ) {
+    val pack = LocalUiThemePack.current
     Button(
         onClick = onClick,
         modifier = modifier,
         enabled = enabled,
-        shape = RoundedCornerShape(18.dp),
-        border = BorderStroke(1.dp, theme.primary.copy(alpha = if (enabled) .55f else .18f)),
+        shape = RoundedCornerShape(pack.corner.coerceAtMost(24).dp),
+        border = BorderStroke(
+            if (pack == UiThemePack.ARCADE) 2.dp else 1.dp,
+            pack.accent.copy(alpha = if (enabled) .82f else .18f),
+        ),
         colors = ButtonDefaults.buttonColors(
-            containerColor = Color.White,
-            contentColor = theme.primary,
+            containerColor = pack.surface,
+            contentColor = pack.accent,
             disabledContainerColor = Color(0xFFF1F5F9),
             disabledContentColor = Color(0xFF94A3B8),
         ),

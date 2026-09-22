@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">팁 전송 데모</string>
-    <string name="nfc_session_service_description">팁 전송 NFC 수신</string>
+    <string name="app_name">팁팝</string>
+    <string name="nfc_session_service_description">팁팝 NFC 연결</string>
 </resources>
